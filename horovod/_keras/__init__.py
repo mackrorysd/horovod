@@ -17,19 +17,22 @@ from distutils.version import LooseVersion
 
 import horovod.tensorflow as hvd
 import tensorflow as tf
+from horovod.common.gradient_aggregation import LocalGradientAggregationHelper
 
 
 _PRE_TF_2_4_0 = LooseVersion(tf.__version__) < LooseVersion('2.4.0')
 
 
 def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sparse,
-                                 compression, sparse_as_dense, gradient_predivide_factor):
+                                 compression, sparse_as_dense, gradient_predivide_factor,
+                                 aggregation_frequency):
     class _DistributedOptimizer(keras.optimizers.Optimizer):
         _HAS_AGGREGATE_GRAD = True
 
         def __init__(self, **kwargs):
             self._name = name or "Distributed%s" % self.__class__.__base__.__name__
             self._aggregated_gradients = False
+
             self._allreduce_grads = hvd._make_allreduce_grads_fn(
                 self._name,
                 device_dense,
@@ -38,6 +41,13 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                 sparse_as_dense,
                 hvd.Average,
                 gradient_predivide_factor)
+
+            self._agg_helper = LocalGradientAggregationHelper(
+                aggregation_frequency,
+                self._allreduce_grads,
+                sparse_as_dense,
+            )
+
             super(self.__class__, self).__init__(**kwargs)
 
         def get_gradients(self, loss, params):
@@ -63,16 +73,29 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
 
         def _allreduce(self, grads):
             self._aggregated_gradients = True
-            return self._allreduce_grads(grads)
+            if hvd.size() > 1:
+                self._agg_helper.init_aggregation_vars(
+                    grads,
+                    sess=tf.keras.backend.get_session(op_input_list=()),
+                )
+                allreduced_grads = self._agg_helper.compute_gradients(tuple(grads))
+                with tf.control_dependencies(allreduced_grads):
+                    return [tf.identity(grad) for grad in allreduced_grads]
+            else:
+                return grads
 
         def apply_gradients(self, *args, **kwargs):
-            results = super(self.__class__, self).apply_gradients(*args, **kwargs)
             if not self._aggregated_gradients:
                 raise Exception('`apply_gradients()` was called without a call to '
                                 '`get_gradients()` or `_aggregate_gradients`. If you\'re '
                                 'using TensorFlow 2.0, please specify '
                                 '`experimental_run_tf_function=False` in `compile()`.')
-            return results
+
+            return self._agg_helper.apply_gradients(
+                lambda: super(self.__class__, self).apply_gradients(*args, **kwargs),
+                *args,
+                **kwargs,
+            )
 
     # We dynamically create a new class that inherits from the optimizer that was passed in.
     # The goal is to override get_gradients() method with an allreduce implementation.
@@ -80,6 +103,7 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
     # model could be easily restored without Horovod.
     cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
                dict(_DistributedOptimizer.__dict__))
+
     return cls.from_config(optimizer.get_config())
 
 
