@@ -18,7 +18,7 @@ import tensorflow as tf
 
 
 def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sparse,
-                                 compression, sparse_as_dense):
+                                 compression, sparse_as_dense, aggregation_frequency):
     class _DistributedOptimizer(keras.optimizers.Optimizer):
         _HAS_AGGREGATE_GRAD = True
 
@@ -29,6 +29,20 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
             self._compression = compression
             self._sparse_as_dense = sparse_as_dense
             self._aggregated_gradients = False
+
+            # How often are parameters synchronized
+            self._aggregation_frequency = aggregation_frequency
+            assert self._aggregation_frequency > 0
+
+            # This is going to be N data structure holding the aggregated gradient updates
+            # for parameter updates. N is the number of parameters.
+            self.gpu_shadow_vars = []
+
+            # Used to know when to allreduce and apply gradients. We allreduce when `self.counter`
+            # is equal to `self._aggregation_frequency`. We apply gradients when `self.counter` is
+            # equal to 0.
+            self.counter = None
+
             super(self.__class__, self).__init__(**kwargs)
 
         def get_gradients(self, loss, params):
@@ -40,23 +54,92 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
             In DistributedOptimizer, get_gradients() is overriden to also
             allreduce the gradients before returning them.
             """
-            gradients = super(self.__class__, self).get_gradients(loss, params)
-            return self._allreduce(gradients)
+            self.grads = super(self.__class__, self).get_gradients(loss, params)
+            return self._allreduce()
 
         def _aggregate_gradients(self, grads_and_vars):
-            gradients = [grad for grad, var in grads_and_vars]
-            return self._allreduce(gradients)
+            self.grads = [grad for grad, var in grads_and_vars]
+            return self._allreduce()
 
-        def _allreduce(self, gradients):
-            self._aggregated_gradients = True
-            if hvd.size() > 1:
-                averaged_gradients = []
-                with tf.name_scope(self._name + "_Allreduce"):
-                    for grad in gradients:
-                        if grad is not None:
+        def _allreduce(self):
+            def init_aggregation_vars():
+                v = tf.get_collection('aggregation_variables')
+                vars_init_op = tf.variables_initializer(v)
+                sess = tf.keras.backend.get_session(op_input_list=())
+
+                with tf.variable_scope("aggregation_variables"):
+                    self.counter = tf.get_variable(
+                        "aggregation_counter", shape=(), dtype=tf.int32,
+                        trainable=False, initializer=tf.zeros_initializer())
+                    if self._aggregation_frequency > 1:
+                        for idx, grad in enumerate(self.grads):
+                            grad_aggregation_variable_name = str(idx)
                             if self._sparse_as_dense and \
                                     isinstance(grad, tf.IndexedSlices):
                                 grad = tf.convert_to_tensor(grad)
+                            elif isinstance(grad, tf.IndexedSlices):
+                                raise AssertionError(
+                                    "IndexedSlices are not supported when `self._aggregation_frequency` > 1 and `self._sparse_as_dense is False")
+                            grad_aggregation_variable = tf.get_variable(
+                                grad_aggregation_variable_name, shape=grad.get_shape().as_list(),
+                                trainable=False, initializer=tf.zeros_initializer(),
+                                collections=[tf.GraphKeys.LOCAL_VARIABLES, "aggregating_collection"])
+                            self.gpu_shadow_vars.append(
+                                grad_aggregation_variable)
+                        assert len(self.gpu_shadow_vars) == len(self.grads)
+                    vars_init_op = tf.variables_initializer(
+                        [self.counter, *self.gpu_shadow_vars])
+                    sess.run(vars_init_op)
+
+            def clear_grads():
+                clear_ops_list = []
+                for idx, grad in enumerate(self.gpu_shadow_vars):
+                    grad_aggregation_variable_name = str(idx)
+                    grad_aggregator = tf.get_variable(
+                        grad_aggregation_variable_name)
+                    clear_op = grad_aggregator.assign(
+                        grad_aggregator.initial_value)
+                    clear_ops_list.append(clear_op)
+                return tf.group(*clear_ops_list)
+
+            def aggregate_grads():
+                aggregation_ops_list = []
+                if self._aggregation_frequency > 1:
+                    for idx, grad in enumerate(self.grads):
+                        if self._sparse_as_dense and \
+                                isinstance(grad, tf.IndexedSlices):
+                            grad = tf.convert_to_tensor(grad)
+                        grad_aggregation_variable_name = str(idx)
+                        grad_aggregator = tf.get_variable(
+                            grad_aggregation_variable_name)
+                        update_op = grad_aggregator.assign_add(grad)
+                        aggregation_ops_list.append(update_op)
+                return aggregation_ops_list
+
+            def allreduce_grads():
+                if self._aggregation_frequency > 1:
+                    # Read in latest variables values.
+                    aggregated_grads = []
+                    aggregation_read_ops_list = []
+                    with tf.variable_scope("aggregation_variables", reuse=True):
+                        for idx, grad in enumerate(self.gpu_shadow_vars):
+                            grad_aggregation_variable_name = str(idx)
+                            grad_aggregator = tf.get_variable(
+                                grad_aggregation_variable_name)
+                            aggregated_grads.append(
+                                grad_aggregator.read_value())
+                            aggregation_read_ops_list.append(
+                                aggregated_grads[idx])
+                    aggregation_read_ops = tf.group(
+                        *aggregation_read_ops_list)
+                else:
+                    aggregated_grads = self.grads
+                    aggregation_read_ops = tf.no_op()
+
+                with tf.control_dependencies([aggregation_read_ops]):
+                    averaged_gradients = []
+                    for idx, grad in enumerate(aggregated_grads):
+                        if grad is not None:
                             avg_grad = hvd.allreduce(grad,
                                                      device_dense=self._device_dense,
                                                      device_sparse=self._device_sparse,
@@ -64,9 +147,36 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                             averaged_gradients.append(avg_grad)
                         else:
                             averaged_gradients.append(None)
-                    return averaged_gradients
+                    with tf.control_dependencies([g.op for g in averaged_gradients]):
+                        reset_op = self.counter.assign(
+                            tf.constant(0), use_locking=True)
+                    with tf.control_dependencies([reset_op]):
+                        return [tf.divide(g, self._aggregation_frequency) for g in averaged_gradients]
+
+            init_aggregation_vars()
+            self._aggregated_gradients = True
+            if hvd.size() > 1:
+                if self._aggregation_frequency > 1:
+                    with tf.variable_scope("aggregation_variables", reuse=True):
+                        clear_op = tf.cond(
+                            tf.equal(self.counter, 0), clear_grads, tf.no_op)
+                        with tf.control_dependencies([clear_op]):
+                            aggregation_ops_list = aggregate_grads()
+
+                    aggregation_ops = tf.group(*aggregation_ops_list)
+                    with tf.control_dependencies([aggregation_ops]):
+                        update_ops = [self.counter.assign_add(tf.constant(1))]
+                else:
+                    update_ops = []
+                with tf.control_dependencies(update_ops):
+                    return tf.cond(
+                        tf.logical_or(tf.equal(self._aggregation_frequency, 1), tf.equal(
+                            self.counter, self._aggregation_frequency)),
+                        allreduce_grads,
+                        lambda: self.grads,
+                    )
             else:
-                return gradients
+                return self.grads
 
         def apply_gradients(self, *args, **kwargs):
             if not self._aggregated_gradients:
@@ -74,7 +184,12 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                                 '`get_gradients()` or `_aggregate_gradients`. If you\'re '
                                 'using TensorFlow 2.0, please specify '
                                 '`experimental_run_tf_function=False` in `compile()`.')
-            return super(self.__class__, self).apply_gradients(*args, **kwargs)
+
+            # Flattening args[0] is necessary to force TensorFlow to finish aggregating gradients
+            # and allreducing them before we apply them.
+            flattended_args0 = [item for tup in args[0] for item in tup]
+            with tf.control_dependencies(flattended_args0):
+                return tf.cond(tf.equal(self.counter, 0), lambda: super(self.__class__, self).apply_gradients(*args, **kwargs), tf.no_op)
 
     # We dynamically create a new class that inherits from the optimizer that was passed in.
     # The goal is to override get_gradients() method with an allreduce implementation.
@@ -82,6 +197,7 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
     # model could be easily restored without Horovod.
     cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
                dict(_DistributedOptimizer.__dict__))
+
     return cls.from_config(optimizer.get_config())
 
 
