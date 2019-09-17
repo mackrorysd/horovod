@@ -45,7 +45,7 @@ class LocalGradientAggregationHelper:
         self.not_none_indexes = {}
         self.num_none_grad_updates = 0
 
-    def init_aggregation_vars(self, grads, sess=None):
+    def _init_aggregation_vars(self, grads):
         with tf.compat.v1.variable_scope("aggregation_variables"):
             self.counter = tf.compat.v1.get_variable(
                 "aggregation_counter", shape=(), dtype=tf.int32,
@@ -130,6 +130,8 @@ class LocalGradientAggregationHelper:
                 return averaged_gradients
 
     def compute_gradients(self, grads):
+        self._init_aggregation_vars(grads)
+
         clear_op = tf.cond(pred=tf.equal(self.counter, 0), true_fn=lambda: self._clear_grads(), false_fn=tf.no_op)
         with tf.control_dependencies([clear_op]):
             aggregation_ops_list = self._aggregate_grads(grads)
@@ -171,7 +173,7 @@ class LocalGradientAggregationHelper:
             )
 
         def increment_optimizer_iteration():
-            if hasattr(optimizer, "_iterations"):
+            if hasattr(optimizer, "_iterations") and optimizer._iterations is not None:
                 return optimizer._iterations.assign_add(1).op
             return tf.no_op()
 
