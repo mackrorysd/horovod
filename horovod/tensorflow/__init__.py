@@ -20,6 +20,7 @@ import os
 import warnings
 
 from horovod.common.util import check_extension, gpu_available
+from horovod.common.gradient_aggregation import LocalGradientAggregationHelper
 
 check_extension('horovod.tensorflow', 'HOROVOD_WITH_TENSORFLOW', __file__, 'mpi_lib')
 
@@ -296,7 +297,8 @@ if _LegacyOptimizer is not None:
 
         def __init__(self, optimizer, name=None, use_locking=False, device_dense='',
                     device_sparse='', compression=Compression.none,
-                    sparse_as_dense=False, op=Average, gradient_predivide_factor=1.0):
+                    sparse_as_dense=False, op=Average, gradient_predivide_factor=1.0,
+                    aggregation_frequency=1):
             if name is None:
                 name = "Distributed{}".format(type(optimizer).__name__)
             super(_DistributedOptimizer, self).__init__(name=name, use_locking=use_locking)
@@ -305,6 +307,8 @@ if _LegacyOptimizer is not None:
             self._allreduce_grads = _make_allreduce_grads_fn(
                 name, device_dense, device_sparse, compression, sparse_as_dense, op,
                 gradient_predivide_factor)
+
+            self._agg_helper = LocalGradientAggregationHelper(aggregation_frequency, self._allreduce_grads, sparse_as_dense)
 
         def compute_gradients(self, *args, **kwargs):
             """Compute gradients of all trainable variables.
@@ -316,12 +320,13 @@ if _LegacyOptimizer is not None:
             """
             gradients = self._optimizer.compute_gradients(*args, **kwargs)
             grads, vars = zip(*gradients)
-            avg_grads = self._allreduce_grads(grads)
-            return list(zip(avg_grads, vars))
+            self._agg_helper.init_aggregation_vars(grads)
+            allreduced_grads = self._agg_helper.compute_gradients(grads)
+            return list(zip(allreduced_grads, vars))
 
         def apply_gradients(self, *args, **kwargs):
-            """Calls this same method on the underlying optimizer."""
-            return self._optimizer.apply_gradients(*args, **kwargs)
+            """Calls this same method from the local gradient aggregation helper."""
+            return self._agg_helper.apply_gradients(lambda: self._optimizer.apply_gradients(*args, **kwargs), *args, **kwargs)
 
         def get_slot(self, *args, **kwargs):
             """Calls this same method on the underlying optimizer."""
@@ -434,7 +439,7 @@ if _LegacyOptimizer is not None:
 
 def DistributedOptimizer(optimizer, name=None, use_locking=False, device_dense='',
                          device_sparse='', compression=Compression.none,
-                         sparse_as_dense=False, backward_passes_per_step=1,
+                         sparse_as_dense=False, aggregation_frequency=1,
                          op=Average, gradient_predivide_factor=1.0):
     """Construct a new DistributedOptimizer, which uses another optimizer
     under the hood for computing single-process gradient values and
@@ -465,10 +470,6 @@ def DistributedOptimizer(optimizer, name=None, use_locking=False, device_dense='
         Treat all sparse gradients as dense tensors.  This can help improve
         performance and memory utilization if the original sparse gradient
         has high density.  Defaults to false.
-      backward_passes_per_step:
-        Number of backward passes to perform before calling hvd.allreduce.
-        This allows accumulating updates over multiple mini-batches before
-        reducing and applying them.
       op:
         The reduction operation to use when combining gradients across
         different ranks.
@@ -477,6 +478,9 @@ def DistributedOptimizer(optimizer, name=None, use_locking=False, device_dense='
         before and after the sum. Gradients are scaled by
         1.0 / gradient_predivide_factor before the sum and
         gradient_predivide_factor / size after the sum.
+      aggregation_frequency:
+        How many batches to aggregate the gradients before
+        averaging the gradients with allreduce.
     """
     if gradient_predivide_factor != 1.0:
         if rocm_built():
@@ -487,22 +491,19 @@ def DistributedOptimizer(optimizer, name=None, use_locking=False, device_dense='
     if isinstance(optimizer, _LegacyOptimizer):
         if op == Adasum:
             return _DistributedAdasumOptimizer(optimizer, name, use_locking, device_dense,
-                                            device_sparse, compression, backward_passes_per_step)
+                                            device_sparse, compression, aggregation_frequency)
         else:
-            if backward_passes_per_step > 1:
-                raise ValueError('backward_passes_per_step>1 is not supported yet with '
-                                 'op != Adasum')
             return _DistributedOptimizer(optimizer, name, use_locking, device_dense,
                                         device_sparse, compression, sparse_as_dense, op,
-                                        gradient_predivide_factor)
+                                        gradient_predivide_factor, aggregation_frequency)
     elif isinstance(optimizer, tf.keras.optimizers.Optimizer):
         if op == Adasum:
             raise ValueError('op == Adasum is not supported yet with Keras')
-        if backward_passes_per_step > 1:
-            raise ValueError('backward_passes_per_step > 1 is not supported yet with Keras')
+
         import horovod.tensorflow.keras as hvd_k
         return hvd_k.DistributedOptimizer(optimizer, name, device_dense, device_sparse,
-                                          compression, sparse_as_dense, gradient_predivide_factor)
+                                          compression, sparse_as_dense, gradient_predivide_factor,
+                                          aggregation_frequency)
     else:
         raise ValueError('Provided optimizer doesn\'t inherit from either legacy '
                          'TensorFlow or Keras optimizer: %s' % optimizer)

@@ -49,7 +49,8 @@ def DistributedOptimizer(optimizer, name=None,
                          device_dense='', device_sparse='',
                          compression=Compression.none,
                          sparse_as_dense=False,
-                         gradient_predivide_factor=1.0):
+                         gradient_predivide_factor=1.0,
+                         aggregation_frequency=1):
     """
     An optimizer that wraps another keras.optimizers.Optimizer, using an allreduce to
     average gradient values before applying gradients to model weights.
@@ -74,13 +75,16 @@ def DistributedOptimizer(optimizer, name=None,
                                    before and after the sum. Gradients are scaled by
                                    1.0 / gradient_predivide_factor before the sum and
                                    gradient_predivide_factor / size after the sum.
+        aggregation_frequency: How many batches to aggregate the gradients before
+                               averaging the gradients with allreduce.
     """
     if gradient_predivide_factor != 1.0 and rocm_built():
             raise ValueError('gradient_predivide_factor not supported yet with ROCm')
 
     return _impl.create_distributed_optimizer(keras, optimizer, name,
                                               device_dense, device_sparse, compression,
-                                              sparse_as_dense, gradient_predivide_factor)
+                                              sparse_as_dense, gradient_predivide_factor,
+                                              aggregation_frequency)
 
 
 def broadcast_global_variables(root_rank):
