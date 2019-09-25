@@ -18,7 +18,8 @@ import tensorflow as tf
 
 
 def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sparse,
-                                 compression, sparse_as_dense, aggregation_frequency):
+                                 compression, sparse_as_dense, aggregation_frequency,
+                                 grad_updated_sizes_dict):
     class _DistributedOptimizer(keras.optimizers.Optimizer):
         _HAS_AGGREGATE_GRAD = True
 
@@ -33,6 +34,11 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
             # How often are parameters synchronized
             self._aggregation_frequency = aggregation_frequency
             assert self._aggregation_frequency > 0
+
+            # A dictionary containing the shape of each grad.
+            # This is used when gradient aggregation frequency > 1 and
+            # there are grads that have dynamically set shapes.
+            self.grad_updated_sizes_dict = grad_updated_sizes_dict
 
             # This is going to be N data structure holding the aggregated gradient updates
             # for parameter updates. N is the number of parameters.
@@ -80,8 +86,14 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                             elif isinstance(grad, tf.IndexedSlices):
                                 raise AssertionError(
                                     "IndexedSlices are not supported when `self._aggregation_frequency` > 1 and `self._sparse_as_dense is False")
+                            if self.grad_updated_sizes_dict:
+                                if str(idx) not in self.grad_updated_sizes_dict:
+                                    raise AssertionError
+                                tensor_shape = self.grad_updated_sizes_dict[str(idx)]
+                            else:
+                                tensor_shape = grad.get_shape().as_list()
                             grad_aggregation_variable = tf.get_variable(
-                                grad_aggregation_variable_name, shape=grad.get_shape().as_list(),
+                                grad_aggregation_variable_name, shape=tensor_shape,
                                 trainable=False, initializer=tf.zeros_initializer(),
                                 collections=[tf.GraphKeys.LOCAL_VARIABLES, "aggregating_collection"])
                             self.gpu_shadow_vars.append(
@@ -197,7 +209,6 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
     # model could be easily restored without Horovod.
     cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
                dict(_DistributedOptimizer.__dict__))
-
     return cls.from_config(optimizer.get_config())
 
 

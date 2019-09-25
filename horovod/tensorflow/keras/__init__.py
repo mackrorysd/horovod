@@ -52,7 +52,8 @@ except:
 def DistributedOptimizer(optimizer, name=None,
                          device_dense='', device_sparse='',
                          compression=Compression.none,
-                         sparse_as_dense=False, aggregation_frequency=1):
+                         sparse_as_dense=False, aggregation_frequency=1,
+                         grad_updated_sizes_dict=None):
     """
     An optimizer that wraps another keras.optimizers.Optimizer, using an allreduce to
     average gradient values before applying gradients to model weights.
@@ -74,10 +75,15 @@ def DistributedOptimizer(optimizer, name=None,
                          the original sparse gradient has high density.
                          Defaults to false.
         aggregation_frequency: How many batches to aggregate the gradients before
-                               averaging the gradients with allreduce.      """
+                               averaging the gradients with allreduce.
+
+        grad_updated_sizes_dict: A dictionary containing the shape of each
+                                 update grad.
+        """
     return _impl.create_distributed_optimizer(keras, optimizer, name,
                                               device_dense, device_sparse, compression,
-                                              sparse_as_dense, aggregation_frequency)
+                                              sparse_as_dense, aggregation_frequency,
+                                              grad_updated_sizes_dict)
 
 
 def broadcast_global_variables(root_rank):
