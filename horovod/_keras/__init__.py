@@ -332,6 +332,10 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
             with tf.control_dependencies(flattended_args0):
                 return tf.cond(tf.equal(self.counter, 0), lambda: super(self.__class__, self).apply_gradients(*args, **kwargs), tf.no_op)
 
+        @classmethod
+        def from_config(cls, cfg):
+            return cls(name, device_dense, device_sparse, compression, sparse_as_dense, cfg)
+
     # We dynamically create a new class that inherits from the optimizer that was passed in.
     # The goal is to override get_gradients() method with an allreduce implementation.
     # This class will have the same name as the optimizer it's wrapping, so that the saved

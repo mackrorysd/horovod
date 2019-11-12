@@ -31,6 +31,7 @@ except ImportError:
 
 import six
 import yaml
+import cloudpickle
 
 import horovod
 
@@ -44,6 +45,8 @@ from horovod.run.task import task_service
 from horovod.run.util import cache, threads, network
 from horovod.run.gloo_run import gloo_run
 from horovod.run.mpi_run import mpi_run
+from horovod.run.http.http_client import read_data_from_kvstore, put_data_into_kvstore
+from horovod.run.http.http_server import KVStoreServer
 
 
 # Cached information of horovodrun functions be stored in this directory
@@ -214,7 +217,7 @@ def _driver_fn(all_host_names, local_host_names, settings):
     # Launch a TCP server called service service on the host running
     # horovodrun.
     driver = driver_service.HorovodRunDriverService(
-        settings.num_hosts, settings.key)
+        settings.num_hosts, settings.key, settings.nic)
     if settings.verbose >= 2:
         print('Launched horovodrun server.')
     # Have all the workers register themselves with the service service.
@@ -263,6 +266,24 @@ def _driver_fn(all_host_names, local_host_names, settings):
         return common_intfs
     finally:
         driver.shutdown()
+
+
+def _get_driver_ip(common_intfs):
+    """
+    :param common_intfs: object return by `_driver_fn`
+    :return: driver ip. We make sure all workers can connect to this ip.
+    """
+    iface = list(common_intfs)[0]
+    driver_ip = None
+    for addr in net_if_addrs()[iface]:
+        if addr.family == AF_INET:
+            driver_ip = addr.address
+
+    if not driver_ip:
+        raise RuntimeError(
+            'Cannot find an IPv4 address of the common interface.')
+
+    return driver_ip
 
 
 def check_build(verbose):
@@ -406,10 +427,18 @@ def parse_args():
                              'HOROVOD_START_TIMEOUT can also be used to '
                              'specify the initialization timeout.')
 
+    parser.add_argument('--network-interface', action='store', dest='nic',
+                        help='Specify the network interface used for communication.')
+
+    parser.add_argument('--output-filename', action='store',
+                        help='For Gloo, writes stdout / stderr of all processes to a filename of the form '
+                             '<output_filename>/rank.<rank>/<stdout | stderr>. The <rank> will be padded with 0 '
+                             'characters to ensure lexicographical order. For MPI, delegates its behavior to mpirun.')
+
     parser.add_argument('--verbose', action='store_true',
                         dest='verbose',
                         help='If this flag is set, extra messages will '
-                             'printed.')
+                             'be printed.')
 
     parser.add_argument('command', nargs=argparse.REMAINDER,
                         help='Command to be executed.')
@@ -526,6 +555,10 @@ def parse_args():
                                                 'of Horovod.')
     group_mpi_threads_disable.add_argument('--no-mpi-threads-disable', dest='mpi_threads_disable',
                                            action=make_override_false_action(override_args), help=argparse.SUPPRESS)
+    group_library_options.add_argument('--mpi-args', action='store', dest='mpi_args',
+                                       help='Extra MPI arguments to pass to mpirun. '
+                                       'They need to be passed with the equal sign to avoid parsing issues. '
+                                       'e.g. --mpi-args="--map-by ppr:6:node"')
     group_library_options.add_argument('--num-nccl-streams', action=make_override_action(override_args),
                                        type=int, default=1,
                                        help='Number of NCCL streams. Only applies when running with NCCL support. '
@@ -534,6 +567,10 @@ def parse_args():
                                        type=int, default=0,
                                        help='MLSL background thread affinity. Only applies when running with MLSL '
                                             'support. (default: %(default)s)')
+    group_library_options.add_argument('--gloo-timeout-seconds', action=make_override_action(override_args),
+                                       type=int, default=30,
+                                       help='Timeout in seconds for Gloo operations to complete. '
+                                            '(default: %(default)s)')
 
     group_logging = parser.add_argument_group('logging arguments')
     group_logging.add_argument('--log-level', action=make_override_action(override_args),
@@ -578,6 +615,67 @@ def parse_args():
     return args
 
 
+class HorovodArgs(object):
+
+    def __init__(self):
+        self.np = 1
+        self.check_build = None
+        self.ssh_port = None
+        self.disable_cache = None
+        self.start_timeout = None
+        self.output_filename = None
+        self.verbose = None
+        self.command = None
+        self.run_func = None
+        self.config_file = None
+        self.nic = None
+
+        # tuneable parameter arguments
+        self.fusion_threshold_mb = None
+        self.cycle_time_ms = None,
+        self.cache_capacity = None,
+
+        # hierrachy
+        self.hierarchical_allreduce = None
+        self.hierarchical_allgather = None
+
+        # autotune arguments
+        self.autotune = None
+        self.autotune_log_file = None
+        self.autotune_warmup_samples = None
+        self.autotune_steps_per_sample = None
+        self.autotune_bayes_opt_max_samples = None
+        self.autotune_gaussian_process_noise = None
+
+        # timeline arguments
+        self.timeline_filename = None
+        self.timeline_mark_cycles = None
+
+        # stall check arguments
+        self.no_stall_check = None
+        self.stall_check_warning_time_seconds = None
+        self.stall_check_shutdown_time_seconds = None
+
+        # library arguments
+        self.mpi_threads_disable = None
+        self.mpi_args = None
+        self.num_nccl_streams = None
+        self.mlsl_bgt_affinity = None
+        self.gloo_timeout_seconds = None
+
+        # logging arguments
+        self.log_level = None
+        self.log_hide_timestamp = None
+
+        # host arguments
+        self.hosts = None
+        self.hostfile = None
+
+        # controller arguments
+        self.use_gloo = None
+        self.use_mpi = None
+
+
 def parse_host_files(filename):
     hosts = []
     for line in open(filename):
@@ -588,9 +686,7 @@ def parse_host_files(filename):
     return ','.join(hosts)
 
 
-def run():
-    args = parse_args()
-
+def _run(args):
     if args.check_build:
         check_build(args.verbose)
 
@@ -626,12 +722,15 @@ def run():
                                     'parameter if you have too many servers.')
     settings = hvd_settings.Settings(verbose=2 if args.verbose else 0,
                                      ssh_port=args.ssh_port,
+                                     extra_mpi_args=args.mpi_args,
                                      key=secret.make_secret_key(),
                                      timeout=tmout,
                                      num_hosts=len(all_host_names),
                                      num_proc=args.np,
                                      hosts=args.hosts,
-                                     command=args.command)
+                                     output_filename=args.output_filename,
+                                     run_func_mode=args.run_func is not None,
+                                     nic=args.nic)
 
     # This cache stores the results of checks performed by horovodrun
     # during the initialization step. It can be disabled by setting
@@ -688,6 +787,8 @@ def run():
         # 127.0.0.1
         common_intfs = set()
         for iface, addrs in net_if_addrs().items():
+            if settings.nic and iface != settings.nic:
+                continue
             for addr in addrs:
                 if addr.family == AF_INET and addr.address == '127.0.0.1':
                     common_intfs.add(iface)
@@ -699,28 +800,154 @@ def run():
         if settings.verbose >= 2:
             print('Local interface found ' + ' '.join(common_intfs))
 
+    # get the driver IPv4 address
+    driver_ip = _get_driver_ip(common_intfs)
+
+    if args.run_func:
+        run_func_server = KVStoreServer(verbose=settings.verbose)
+        run_func_server_port = run_func_server.start_server()
+        pickled_exec_func = cloudpickle.dumps(args.run_func)
+        put_data_into_kvstore(driver_ip, run_func_server_port,
+                              'runfunc', 'func', pickled_exec_func)
+
+        command = [sys.executable, '-m', 'horovod.run.run_task', str(driver_ip), str(run_func_server_port)]
+
+        try:
+            _launch_job(args, remote_host_names, settings, common_intfs, command)
+            results = [None] * args.np
+            # TODO: make it parallel to improve performance
+            for i in range(args.np):
+                pickled_result = read_data_from_kvstore(driver_ip, run_func_server_port,
+                                                        'runfunc_result', str(i))
+                results[i] = cloudpickle.loads(pickled_result)
+            return results
+        finally:
+            run_func_server.shutdown_server()
+    else:
+        command = args.command
+        _launch_job(args, remote_host_names, settings, common_intfs, command)
+        return None
+
+
+def _launch_job(args, remote_host_names, settings, common_intfs, command):
     env = os.environ.copy()
     config_parser.set_env_from_args(env, args)
+    driver_ip = _get_driver_ip(common_intfs)
 
     if args.use_gloo:
         if not gloo_built(verbose=(settings.verbose >= 2)):
             raise ValueError('Gloo support has not been built.  If this is not expected, ensure CMake is installed '
                              'and reinstall Horovod with HOROVOD_WITH_GLOO=1 to debug the build error.')
-        gloo_run(settings, remote_host_names, common_intfs, env)
+        gloo_run(settings, remote_host_names, common_intfs, env, driver_ip, command)
     elif args.use_mpi:
         if not mpi_built(verbose=(settings.verbose >= 2)):
             raise ValueError('MPI support has not been built.  If this is not expected, ensure MPI is installed '
                              'and reinstall Horovod with HOROVOD_WITH_MPI=1 to debug the build error.')
-        mpi_run(settings, common_intfs, env)
+        mpi_run(settings, common_intfs, env, command)
     else:
         if mpi_built(verbose=(settings.verbose >= 2)):
-            mpi_run(settings, common_intfs, env)
+            mpi_run(settings, common_intfs, env, command)
         elif gloo_built(verbose=(settings.verbose >= 2)):
-            gloo_run(settings, remote_host_names, common_intfs, env)
+            gloo_run(settings, remote_host_names, common_intfs, env, driver_ip, command)
         else:
             raise ValueError('Neither MPI nor Gloo support has been built. Try reinstalling Horovod ensuring that '
                              'either MPI is installed (MPI) or CMake is installed (Gloo).')
 
 
+def run_commandline():
+    args = parse_args()
+    args.run_func = None
+    _run(args)
+
+
+def run(
+        func,
+        args=(),
+        kwargs=None,
+        np=1,
+        hosts=None,
+        hostfile=None,
+        start_timeout=None,
+        ssh_port=None,
+        disable_cache=None,
+        output_filename=None,
+        verbose=None,
+        use_gloo=None,
+        use_mpi=None,
+        network_interface=None):
+    """
+    Launch a Horovod job to run the specified process function and get the return value.
+
+    :param func: The function to be run in Horovod job processes. The function return value will
+                 be collected as the corresponding Horovod process return value.
+                 This function must be compatible with pickle.
+    :param args: Arguments to pass to `func`.
+    :param kwargs: Keyword arguments to pass to `func`.
+    :param np: Number of Horovod processes.
+    :param hosts: List of host names and the number of available slots
+                  for running processes on each, of the form: <hostname>:<slots>
+                  (e.g.: host1:2,host2:4,host3:1 indicating 2 processes can run on host1,
+                  4 on host2, and 1 on host3). If not specified, defaults to using localhost:<np>
+    :param hostfile: Path to a host file containing the list of host names and the number of
+                     available slots. Each line of the file must be of the form:
+                     <hostname> slots=<slots>
+    :param start_timeout: Horovodrun has to perform all the checks and
+                          start the processes before the specified
+                          timeout. The default value is 30 seconds.
+                          Alternatively, The environment variable
+                          HOROVOD_START_TIMEOUT can also be used to
+                          specify the initialization timeout.
+    :param ssh_port: SSH port on all the hosts.
+    :param disable_cache: If the flag is not set, horovodrun will perform
+                          the initialization checks only once every 60
+                          minutes -- if the checks successfully pass.
+                          Otherwise, all the checks will run every time
+                          horovodrun is called.'
+    :param output_filename: For Gloo, writes stdout / stderr of all processes to a filename of the form
+                            <output_filename>/rank.<rank>/<stdout | stderr>. The <rank> will be padded with 0
+                            characters to ensure lexicographical order.
+                            For MPI, delegates its behavior to mpirun.
+    :param verbose: If this flag is set, extra messages will be printed.
+    :param use_gloo: Run Horovod using the Gloo controller. This will
+                     be the default if Horovod was not built with MPI support.
+    :param use_mpi: Run Horovod using the MPI controller. This will
+                    be the default if Horovod was built with MPI support.
+    :param network_interface: Specify the network interface for communication.
+
+    :return: Return a list which contains values return by all Horovod processes.
+             The index of the list corresponds to the rank of each Horovod process.
+    """
+
+    if kwargs is None:
+        kwargs = {}
+
+    def wrapped_func():
+        return func(*args, **kwargs)
+
+    if hosts is not None and hostfile is not None:
+        raise ValueError('Argument hosts and hostfile only allow one provided.')
+
+    if use_gloo and use_mpi:
+        raise ValueError('Argument use_gloo and use_mpi only allow one set True.')
+
+    hargs = HorovodArgs()
+
+    hargs.np = np
+    hargs.hosts = hosts
+    hargs.hostfile = hostfile
+    hargs.start_timeout = start_timeout
+    hargs.ssh_port = ssh_port
+    hargs.disable_cache = disable_cache
+    hargs.output_filename = output_filename
+    hargs.verbose = verbose
+    hargs.use_gloo = use_gloo
+    hargs.use_mpi = use_mpi
+    hargs.nic = network_interface
+
+    hargs.run_func = wrapped_func
+
+    return _run(hargs)
+
+
 if __name__ == '__main__':
-    run()
+    run_commandline()
