@@ -58,7 +58,7 @@ SSH_ATTEMPTS = 5
 
 
 @cache.use_cache()
-def _check_all_hosts_ssh_successful(host_addresses, ssh_port=None):
+def _check_all_hosts_ssh_successful(host_addresses, ssh_port=None, ssh_ports=None):
     """
     checks if ssh can successfully be performed to all the hosts.
     :param host_addresses: list of addresses to ssh into. for example,
@@ -86,14 +86,17 @@ def _check_all_hosts_ssh_successful(host_addresses, ssh_port=None):
                 output.close()
         return exit_code, output_msg
 
-    ssh_port_arg = '-p {ssh_port}'.format(
-        ssh_port=ssh_port) if ssh_port else ''
+    ssh_port_args = driver_service.get_ssh_port_args(
+        host_addresses,
+        ssh_port=ssh_port,
+        ssh_ports=ssh_ports
+    )
 
     ssh_command_format = 'ssh -o StrictHostKeyChecking=no {host} {ssh_port_arg} date'
 
     args_list = [[ssh_command_format.format(host=host_address,
                                             ssh_port_arg=ssh_port_arg)]
-                 for host_address in host_addresses]
+                 for host_address, ssh_port_arg in zip(host_addresses, ssh_port_args)]
     ssh_exit_codes = \
         threads.execute_function_multithreaded(exec_command,
                                                args_list)
@@ -235,6 +238,9 @@ def parse_args():
 
     parser.add_argument('-p', '--ssh-port', action='store', dest='ssh_port',
                         type=int, help='SSH port on all the hosts.')
+
+    parser.add_argument('--ssh-ports', action='store', dest='ssh_ports',
+                        type=str, help='Comma-separated string of SSH ports for each host.')
 
     parser.add_argument('--disable-cache', action='store_true',
                         dest='disable_cache',
@@ -457,6 +463,7 @@ class HorovodArgs(object):
         self.np = 1
         self.check_build = None
         self.ssh_port = None
+        self.ssh_ports = None
         self.disable_cache = None
         self.start_timeout = None
         self.output_filename = None
@@ -583,6 +590,7 @@ def _run(args):
                                     'parameter if you have too many servers.')
     settings = hvd_settings.Settings(verbose=2 if args.verbose else 0,
                                      ssh_port=args.ssh_port,
+                                     ssh_ports=args.ssh_ports,
                                      extra_mpi_args=args.mpi_args,
                                      tcp_flag=args.tcp_flag,
                                      binding_args=args.binding_args,
@@ -607,6 +615,8 @@ def _run(args):
             params += str(args.hosts) + ' '
         if args.ssh_port:
             params += str(args.ssh_port)
+        elif args.ssh_ports:
+            params += str(args.ssh_ports)
         parameters_hash = hashlib.md5(params.encode('utf-8')).hexdigest()
         fn_cache = cache.Cache(CACHE_FOLDER, CACHE_STALENESS_THRESHOLD_MINUTES,
                                parameters_hash)
@@ -621,8 +631,14 @@ def _run(args):
         if settings.verbose >= 2:
             print('Checking ssh on all remote hosts.')
         # Check if we can ssh into all remote hosts successfully.
-        _check_all_hosts_ssh_successful(remote_host_names, args.ssh_port,
-                                        fn_cache=fn_cache)
+        if args.ssh_ports:
+            ssh_ports = [port for host, port in zip(all_host_names, args.ssh_ports.split(","))
+                         if host in set(remote_host_names)]
+            ssh_ports = ",".join(ssh_ports)
+        else:
+            ssh_ports = None
+        _check_all_hosts_ssh_successful(remote_host_names, ssh_port=args.ssh_port,
+                                        ssh_ports=ssh_ports, fn_cache=fn_cache)
         if settings.verbose >= 2:
             print('SSH was successful into all the remote hosts.')
 
@@ -732,6 +748,7 @@ def run(
         hostfile=None,
         start_timeout=None,
         ssh_port=None,
+        ssh_ports=None,
         disable_cache=None,
         output_filename=None,
         verbose=None,
@@ -762,6 +779,7 @@ def run(
                           HOROVOD_START_TIMEOUT can also be used to
                           specify the initialization timeout.
     :param ssh_port: SSH port on all the hosts.
+    :param ssh_ports: Comma-separated string of SSH ports for each host.
     :param disable_cache: If the flag is not set, horovodrun will perform
                           the initialization checks only once every 60
                           minutes -- if the checks successfully pass.
@@ -803,6 +821,7 @@ def run(
     hargs.hostfile = hostfile
     hargs.start_timeout = start_timeout
     hargs.ssh_port = ssh_port
+    hargs.ssh_ports = ssh_ports
     hargs.mpi_args = mpi_args
     hargs.disable_cache = disable_cache
     hargs.output_filename = output_filename

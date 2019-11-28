@@ -44,6 +44,32 @@ class HorovodRunDriverClient(driver_service.BasicDriverClient):
             match_intf=match_intf)
 
 
+def get_ssh_port_args(all_host_names, ssh_port=None, ssh_ports=None):
+    if ssh_port and ssh_ports:
+        raise ValueError("You can only specify one of `--ssh-port` and `--ssh-ports`")
+
+    if ssh_port:
+        ssh_port_args = [
+            '-p {ssh_port}'.format(ssh_port=ssh_port)
+            for _ in range(len(all_host_names))
+        ]
+    elif ssh_ports:
+        sp_ssh_ports = ssh_ports.split(",")
+        if len(sp_ssh_ports) != len(all_host_names):
+            raise ValueError("If specifying multiple ssh ports, it must be "
+                             "supplied as a comma-separated string of the same "
+                             "length as the host names. Expected "
+                             f"{len(all_host_names)} ssh ports, but parsed "
+                             f"{len(sp_ssh_ports)} ports from {ssh_ports}... {all_host_names}")
+        ssh_port_args = [
+            f"-p {ssh_port}" for ssh_port in sp_ssh_ports
+        ]
+    else:
+        ssh_port_args = ['' for _ in range(len(all_host_names))]
+
+    return ssh_port_args
+
+
 def _launch_task_servers(all_host_names, local_host_names, driver_addresses,
                          settings):
     """
@@ -87,10 +113,12 @@ def _launch_task_servers(all_host_names, local_host_names, driver_addresses,
             host_output.close()
         return exit_code
 
-    if settings.ssh_port:
-        ssh_port_arg = '-p {ssh_port}'.format(ssh_port=settings.ssh_port)
-    else:
-        ssh_port_arg = ''
+    ssh_port_args = get_ssh_port_args(
+        all_host_names,
+        ssh_port=settings.ssh_port,
+        ssh_ports=settings.ssh_ports
+    )
+
     args_list = []
     for index in range(len(all_host_names)):
         host_name = all_host_names[index]
@@ -108,7 +136,7 @@ def _launch_task_servers(all_host_names, local_host_names, driver_addresses,
                 '\'{python} -m horovod.run.task_fn {index} {driver_addresses}' \
                 ' {settings}\''\
                 .format(host=host_name,
-                        ssh_port_arg=ssh_port_arg,
+                        ssh_port_arg=ssh_port_args[index],
                         python=sys.executable,
                         index=codec.dumps_base64(index),
                         driver_addresses=codec.dumps_base64(driver_addresses),
