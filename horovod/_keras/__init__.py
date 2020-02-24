@@ -42,7 +42,8 @@ def _make_allreduce_grads_fn(device_dense, device_sparse, compression):
 
 def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sparse,
                                  compression, sparse_as_dense, aggregation_frequency,
-                                 grad_updated_sizes_dict, profile_frequency, profile_filename):
+                                 grad_updated_sizes_dict, profile_frequency, profile_filename,
+                                 average_aggregated_gradients):
     class _DistributedOptimizer(keras.optimizers.Optimizer):
         _HAS_AGGREGATE_GRAD = True
 
@@ -58,7 +59,8 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                 aggregation_frequency,
                 _make_allreduce_grads_fn(device_dense, device_sparse, compression),
                 sparse_as_dense,
-                grad_updated_sizes_dict
+                grad_updated_sizes_dict,
+                average_aggregated_gradients
             )
             self._profile_helper = TFProfileHelper(profile_frequency, profile_filename)
 
