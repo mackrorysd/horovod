@@ -50,7 +50,8 @@ def DistributedOptimizer(optimizer, name=None,
                          compression=Compression.none,
                          sparse_as_dense=False,
                          gradient_predivide_factor=1.0,
-                         aggregation_frequency=1):
+                         aggregation_frequency=1,
+                         average_aggregated_gradients=False):
     """
     An optimizer that wraps another keras.optimizers.Optimizer, using an allreduce to
     average gradient values before applying gradients to model weights.
@@ -77,14 +78,25 @@ def DistributedOptimizer(optimizer, name=None,
                                    gradient_predivide_factor / size after the sum.
         aggregation_frequency: How many batches to aggregate the gradients before
                                averaging the gradients with allreduce.
+        average_aggregated_gradients: Whether to average the aggregated gradients
+                                      across the iterations. Only possible for
+                                      aggregation_frequency > 1.
     """
     if gradient_predivide_factor != 1.0 and rocm_built():
             raise ValueError('gradient_predivide_factor not supported yet with ROCm')
 
-    return _impl.create_distributed_optimizer(keras, optimizer, name,
-                                              device_dense, device_sparse, compression,
-                                              sparse_as_dense, gradient_predivide_factor,
-                                              aggregation_frequency)
+    return _impl.create_distributed_optimizer(
+        keras=keras,
+        optimizer=optimizer,
+        name=name,
+        device_dense=device_dense,
+        device_sparse=device_sparse,
+        compression=compression,
+        sparse_as_dense=sparse_as_dense,
+        gradient_predivide_factor=gradient_predivide_factor,
+        aggregation_frequency=aggregation_frequency,
+        average_aggregated_gradients=average_aggregated_gradients
+    )
 
 
 def broadcast_global_variables(root_rank):
