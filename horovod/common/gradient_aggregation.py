@@ -171,6 +171,8 @@ class LocalGradientAggregationHelper:
                     lambda: self._allreduce_grads_helper(grads),
                     lambda: grads,
                 )
+                if not isinstance(allreduced_grads, (list, tuple)):
+                    allreduced_grads = (allreduced_grads,)
                 assert len(allreduced_grads) == len(self.gpu_shadow_vars)
                 allreduced_grads = [
                     allreduced_grads[self.not_none_indexes[idx]] if idx in self.not_none_indexes else None
