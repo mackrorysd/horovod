@@ -16,6 +16,7 @@
 import json
 import os
 import threading
+from distutils.version import LooseVersion
 
 import horovod.tensorflow as hvd
 import tensorflow as tf
@@ -57,14 +58,15 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
             self._sparse_as_dense = sparse_as_dense
             self._get_gradients_used = False
 
-            self._agg_helper = LocalGradientAggregationHelper(
-                aggregation_frequency,
-                _make_allreduce_grads_fn(device_dense, device_sparse, compression),
-                sparse_as_dense,
-                grad_updated_sizes_dict,
-                average_aggregated_gradients
-            )
-            self._profile_helper = TFProfileHelper(profile_frequency, profile_filename)
+            if LooseVersion(tf.__version__) < LooseVersion("2.0.0"):
+                self._agg_helper = LocalGradientAggregationHelper(
+                    aggregation_frequency,
+                    _make_allreduce_grads_fn(device_dense, device_sparse, compression),
+                    sparse_as_dense,
+                    grad_updated_sizes_dict,
+                    average_aggregated_gradients
+                )
+                self._profile_helper = TFProfileHelper(profile_frequency, profile_filename)
 
             super(self.__class__, self).__init__(**config)
 
@@ -77,36 +79,67 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
             In DistributedOptimizer, get_gradients() is overriden to also
             allreduce the gradients before returning them.
             """
-
-            self._get_gradients_used = True
-            self.grads = super(
-                self.__class__, self).get_gradients(loss, params)
-            if hvd.size() > 1:
-                self._profile_helper.init_profile_vars(sess=tf.keras.backend.get_session(op_input_list=()))
-                self._agg_helper.init_aggregation_vars(
-                    self.grads,
-                    sess=tf.keras.backend.get_session(op_input_list=()),
-                )
-                with tf.control_dependencies([self._profile_helper.profile_start()]):
-                    allreduced_grads = self._agg_helper.compute_gradients(tuple(self.grads))
-                with tf.control_dependencies(allreduced_grads):
-                    comm_end = self._profile_helper.profile_end()
-                with tf.control_dependencies([comm_end]):
-                    return [tf.identity(grad) for grad in allreduced_grads]
+            self._aggregated_gradients = True
+            if LooseVersion(tf.__version__) >= LooseVersion("2.0.0"):
+                gradients = super(self.__class__, self).get_gradients(loss, params)
+                return self._allreduce(gradients)
             else:
-                return self.grads
+                self.grads = super(
+                    self.__class__, self).get_gradients(loss, params)
+                if hvd.size() > 1:
+                    self._agg_helper.init_aggregation_vars(
+                        self.grads,
+                        sess=tf.compat.v1.keras.backend.get_session(op_input_list=()),
+                    )
+                    with tf.control_dependencies([self._profile_helper.profile_start()]):
+                        allreduced_grads = self._agg_helper.compute_gradients(tuple(self.grads))
+                    with tf.control_dependencies(allreduced_grads):
+                        comm_end = self._profile_helper.profile_end()
+                    with tf.control_dependencies([comm_end]):
+                        return [tf.identity(grad) for grad in allreduced_grads]
+                else:
+                    return self.grads
+
+        def _aggregate_gradients(self, grads_and_vars):
+            gradients = [grad for grad, var in grads_and_vars]
+            return self._allreduce(gradients)
+
+        def _allreduce(self, gradients):
+            self._aggregated_gradients = True
+            if hvd.size() > 1:
+                averaged_gradients = []
+                with tf.name_scope(self._name + "_Allreduce"):
+                    for grad in gradients:
+                        if grad is not None:
+                            if self._sparse_as_dense and \
+                                    isinstance(grad, tf.IndexedSlices):
+                                grad = tf.convert_to_tensor(grad)
+                            avg_grad = hvd.allreduce(grad,
+                                                     device_dense=self._device_dense,
+                                                     device_sparse=self._device_sparse,
+                                                     compression=self._compression)
+                            averaged_gradients.append(avg_grad)
+                        else:
+                            averaged_gradients.append(None)
+                    return averaged_gradients
+            else:
+                return gradients
 
         def apply_gradients(self, *args, **kwargs):
-            if not self._get_gradients_used:
+            if not self._aggregated_gradients:
                 raise Exception('`apply_gradients()` was called without a call to '
                                 '`get_gradients()`. If you\'re using TensorFlow 2.0, '
                                 'please specify `experimental_run_tf_function=False` in '
                                 '`compile()`.')
-            return self._agg_helper.apply_gradients(
-                lambda: super(self.__class__, self).apply_gradients(*args, **kwargs),
-                *args,
-                **kwargs,
-            )
+
+            if LooseVersion(tf.__version__) >= LooseVersion("2.0.0"):
+                return super(self.__class__, self).apply_gradients(*args, **kwargs)
+            else:
+                return self._agg_helper.apply_gradients(
+                    lambda: super(self.__class__, self).apply_gradients(*args, **kwargs),
+                    *args,
+                    **kwargs,
+                )
 
         @classmethod
         def from_config(cls, cfg):
