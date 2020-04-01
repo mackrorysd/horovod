@@ -18,6 +18,7 @@ from distutils.version import LooseVersion
 import horovod.tensorflow as hvd
 import tensorflow as tf
 from horovod.common.gradient_aggregation import LocalGradientAggregationHelper
+from horovod.common.gradient_aggregation_eager import LocalGradientAggregationHelperEager
 
 
 _PRE_TF_2_4_0 = LooseVersion(tf.__version__) < LooseVersion('2.4.0')
@@ -42,13 +43,24 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                 hvd.Average,
                 gradient_predivide_factor)
 
-            self._agg_helper = LocalGradientAggregationHelper(
-                aggregation_frequency,
-                self._allreduce_grads,
-                sparse_as_dense,
-                average_aggregated_gradients
-            )
+            # We save the result of this because `get_gradients` and
+            # `_aggregate_gradients` do not execute eagerly.
+            self._executing_eagerly = hvd._executing_eagerly()
 
+            if not self._executing_eagerly:
+                self._agg_helper = LocalGradientAggregationHelper(
+                    aggregation_frequency,
+                    self._allreduce_grads,
+                    sparse_as_dense,
+                    average_aggregated_gradients
+                )
+            else:
+                self._agg_helper = LocalGradientAggregationHelperEager(
+                    aggregation_frequency,
+                    self._allreduce_grads,
+                    sparse_as_dense,
+                    average_aggregated_gradients
+                )
             super(self.__class__, self).__init__(**kwargs)
 
         def get_gradients(self, loss, params):
@@ -75,17 +87,20 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
         def _allreduce(self, grads):
             self._aggregated_gradients = True
 
-            self._agg_helper.init_aggregation_vars(
-                grads,
-                sess=tf.compat.v1.keras.backend.get_session(op_input_list=()),
-            )
-            return self._agg_helper.compute_gradients(tuple(grads))
+            if self._executing_eagerly:
+                return self._agg_helper.compute_gradients(tuple(grads))
+            else:
+                self._agg_helper.init_aggregation_vars(
+                    grads,
+                    sess=tf.compat.v1.keras.backend.get_session(op_input_list=()),
+                )
+                return self._agg_helper.compute_gradients(tuple(grads))
 
         def apply_gradients(self, *args, **kwargs):
             if not self._aggregated_gradients:
                 raise Exception('`apply_gradients()` was called without a call to '
-                                '`get_gradients()` or `_aggregate_gradients`. If you\'re '
-                                'using TensorFlow 2.0, please specify '
+                                '`get_gradients()`or `_aggregate_gradients` . If you\'re using '
+                                'TensorFlow 2.0 or 2.1, please specify '
                                 '`experimental_run_tf_function=False` in `compile()`.')
 
             return self._agg_helper.apply_gradients(

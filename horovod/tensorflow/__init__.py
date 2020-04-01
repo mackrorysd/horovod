@@ -308,12 +308,13 @@ if _LegacyOptimizer is not None:
                 name, device_dense, device_sparse, compression, sparse_as_dense, op,
                 gradient_predivide_factor)
 
-            self._agg_helper = LocalGradientAggregationHelper(
-                aggregation_frequency=aggregation_frequency,
-                allreduce_func=self._allreduce_grads,
-                sparse_as_dense=sparse_as_dense,
-                average_aggregated_gradients=average_aggregated_gradients
-            )
+            if not _executing_eagerly():
+                self._agg_helper = LocalGradientAggregationHelper(
+                    aggregation_frequency=aggregation_frequency,
+                    allreduce_func=self._allreduce_grads,
+                    sparse_as_dense=sparse_as_dense,
+                    average_aggregated_gradients=average_aggregated_gradients
+                )
 
         def compute_gradients(self, *args, **kwargs):
             """Compute gradients of all trainable variables.
@@ -325,13 +326,19 @@ if _LegacyOptimizer is not None:
             """
             gradients = self._optimizer.compute_gradients(*args, **kwargs)
             grads, vars = zip(*gradients)
-            self._agg_helper.init_aggregation_vars(grads)
-            allreduced_grads = self._agg_helper.compute_gradients(grads)
+            if _executing_eagerly():
+                allreduced_grads = self._allreduce_grads(grads)
+            else:
+                self._agg_helper.init_aggregation_vars(grads)
+                allreduced_grads = self._agg_helper.compute_gradients(grads)
             return list(zip(allreduced_grads, vars))
 
         def apply_gradients(self, *args, **kwargs):
             """Calls this same method from the local gradient aggregation helper."""
-            return self._agg_helper.apply_gradients(lambda: self._optimizer.apply_gradients(*args, **kwargs), *args, **kwargs)
+            if _executing_eagerly():
+                return self._optimizer.apply_gradients(*args, **kwargs)
+            else:
+                return self._agg_helper.apply_gradients(lambda: self._optimizer.apply_gradients(*args, **kwargs), *args, **kwargs)
 
         def get_slot(self, *args, **kwargs):
             """Calls this same method on the underlying optimizer."""
