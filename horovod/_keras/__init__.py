@@ -20,22 +20,27 @@ import threading
 import horovod.tensorflow as hvd
 import tensorflow as tf
 from horovod.common.gradient_aggregation import LocalGradientAggregationHelper
+from horovod.common.gradient_aggregation_eager import LocalGradientAggregationHelperEager
 from horovod.common.tf_profile import TFProfileHelper
 
 
-def _make_allreduce_grads_fn(device_dense, device_sparse, compression):
-    def allreduce_grads(grads):
+def _make_allreduce_grads_fn(name_scope, sparse_as_dense, device_dense, device_sparse, compression):
+    def allreduce_grads(gradients):
         averaged_gradients = []
-        for idx, grad in enumerate(grads):
-            if grad is not None:
-                avg_grad = hvd.allreduce(grad,
-                                         device_dense=device_dense,
-                                         device_sparse=device_sparse,
-                                         compression=compression)
-                averaged_gradients.append(avg_grad)
-            else:
-                averaged_gradients.append(None)
-        return averaged_gradients
+        with tf.name_scope(name_scope):
+            for grad in gradients:
+                if grad is not None:
+                    if sparse_as_dense and \
+                            isinstance(grad, tf.IndexedSlices):
+                        grad = tf.convert_to_tensor(grad)
+                    avg_grad = hvd.allreduce(grad,
+                                             device_dense=device_dense,
+                                             device_sparse=device_sparse,
+                                             compression=compression)
+                    averaged_gradients.append(avg_grad)
+                else:
+                    averaged_gradients.append(None)
+            return averaged_gradients
 
     return allreduce_grads
 
@@ -59,15 +64,29 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
             # `apply_gradients` do not execute eagerly.
             self._executing_eagerly = hvd._executing_eagerly()
 
+            allreduced_grads_fn = _make_allreduce_grads_fn(
+                self._name + "_Allreduce",
+                self._sparse_as_dense,
+                self._device_dense,
+                self._device_sparse,
+                self._compression
+            )
             if not self._executing_eagerly:
                 self._agg_helper = LocalGradientAggregationHelper(
                     aggregation_frequency,
-                    _make_allreduce_grads_fn(device_dense, device_sparse, compression),
+                    allreduced_grads_fn,
                     sparse_as_dense,
                     grad_updated_sizes_dict,
                     average_aggregated_gradients
                 )
                 self._profile_helper = TFProfileHelper(profile_frequency, profile_filename)
+            else:
+                self._agg_helper = LocalGradientAggregationHelperEager(
+                    aggregation_frequency,
+                    allreduced_grads_fn,
+                    sparse_as_dense,
+                    average_aggregated_gradients
+                )
 
             super(self.__class__, self).__init__(**kwargs)
 
@@ -92,24 +111,9 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
 
             if self._executing_eagerly:
                 if hvd.size() > 1:
-                    averaged_gradients = []
-                    with tf.name_scope(self._name + "_Allreduce"):
-                        for grad in self.grads:
-                            if grad is not None:
-                                if self._sparse_as_dense and \
-                                        isinstance(grad, tf.IndexedSlices):
-                                    grad = tf.convert_to_tensor(grad)
-                                avg_grad = hvd.allreduce(grad,
-                                                         device_dense=self._device_dense,
-                                                         device_sparse=self._device_sparse,
-                                                         compression=self._compression)
-                                averaged_gradients.append(avg_grad)
-                            else:
-                                averaged_gradients.append(None)
-                        return averaged_gradients
+                    return self._agg_helper.compute_gradients(tuple(self.grads))
                 else:
                     return self.grads
-
             else:
                 if hvd.size() > 1:
                     self._agg_helper.init_aggregation_vars(
@@ -132,14 +136,11 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                                 'TensorFlow 2.0 or 2.1, please specify '
                                 '`experimental_run_tf_function=False` in `compile()`.')
 
-            if self._executing_eagerly:
-                return super(self.__class__, self).apply_gradients(*args, **kwargs)
-            else:
-                return self._agg_helper.apply_gradients(
-                    lambda: super(self.__class__, self).apply_gradients(*args, **kwargs),
-                    *args,
-                    **kwargs,
-                )
+            return self._agg_helper.apply_gradients(
+                lambda: super(self.__class__, self).apply_gradients(*args, **kwargs),
+                *args,
+                **kwargs,
+            )
 
     # We dynamically create a new class that inherits from the optimizer that was passed in.
     # The goal is to override get_gradients() method with an allreduce implementation.
