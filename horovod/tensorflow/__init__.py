@@ -52,7 +52,8 @@ if tf.__version__.startswith('2.2.'):
 
 def allreduce(tensor, average=None, device_dense='', device_sparse='',
               compression=Compression.none, op=None,
-              prescale_factor=1.0, postscale_factor=1.0):
+              prescale_factor=1.0, postscale_factor=1.0,
+              name=None):
     """Perform an allreduce on a tf.Tensor or tf.IndexedSlices.
 
     This function performs a bandwidth-optimal ring allreduce on the input
@@ -79,6 +80,7 @@ def allreduce(tensor, average=None, device_dense='', device_sparse='',
             Defaults to Average if None is given.
         prescale_factor: Multiplicative factor to scale tensor before allreduce.
         postscale_factor: Multiplicative factor to scale tensor after allreduce.
+        name: A name of the allreduce operation
 
     Returns:
         A tensor of the same shape and type as `tensor`, summed across all
@@ -116,7 +118,8 @@ def allreduce(tensor, average=None, device_dense='', device_sparse='',
             tensor_compressed, ctx = compression.compress(tensor)
             summed_tensor_compressed = _allreduce(tensor_compressed, op=op,
                                                   prescale_factor=prescale_factor,
-                                                  postscale_factor=postscale_factor)
+                                                  postscale_factor=postscale_factor,
+                                                  name=name)
             summed_tensor = compression.decompress(summed_tensor_compressed, ctx)
             if op == Adasum:
                 if 'CPU' not in tensor.device and gpu_available('tensorflow'):
@@ -303,6 +306,17 @@ if _LegacyOptimizer is not None:
                 name, device_dense, device_sparse, compression, sparse_as_dense, op,
                 gradient_predivide_factor)
 
+            self._agg_helper = None
+            if aggregation_frequency > 1:
+                if not _executing_eagerly():
+                    self._agg_helper = LocalGradientAggregationHelper(
+                        aggregation_frequency=aggregation_frequency,
+                        allreduce_func=self._allreduce_grads,
+                        sparse_as_dense=sparse_as_dense,
+                        average_aggregated_gradients=average_aggregated_gradients,
+                        optimizer_type=LocalGradientAggregationHelper._OPTIMIZER_TYPE_LEGACY,
+                    )
+
         def compute_gradients(self, *args, **kwargs):
             """Compute gradients of all trainable variables.
 
@@ -313,12 +327,23 @@ if _LegacyOptimizer is not None:
             """
             gradients = self._optimizer.compute_gradients(*args, **kwargs)
             grads, vars = zip(*gradients)
-            avg_grads = self._allreduce_grads(grads)
-            return list(zip(avg_grads, vars))
+            if self._agg_helper:
+                allreduced_grads = self._agg_helper.compute_gradients(grads)
+            else:
+                allreduced_grads = self._allreduce_grads(grads)
+            return list(zip(allreduced_grads, vars))
 
         def apply_gradients(self, *args, **kwargs):
-            """Calls this same method on the underlying optimizer."""
-            return self._optimizer.apply_gradients(*args, **kwargs)
+            """Calls this same method from the local gradient aggregation helper."""
+            if self._agg_helper:
+                return self._agg_helper.apply_gradients(
+                    lambda: super(self.__class__, self).apply_gradients(*args, **kwargs),
+                    self,
+                    *args,
+                    **kwargs,
+                )
+
+            return super(self.__class__, self).apply_gradients(*args, **kwargs)
 
         def get_slot(self, *args, **kwargs):
             """Calls this same method on the underlying optimizer."""

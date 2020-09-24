@@ -37,7 +37,20 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                 compression,
                 sparse_as_dense,
                 hvd.Average,
-                gradient_predivide_factor)
+                gradient_predivide_factor
+            )
+
+            self._agg_helper = None
+            if aggregation_frequency > 1:
+                if not hvd._executing_eagerly():
+                    self._agg_helper = LocalGradientAggregationHelper(
+                        aggregation_frequency=aggregation_frequency,
+                        allreduce_func=self._allreduce_grads,
+                        sparse_as_dense=sparse_as_dense,
+                        average_aggregated_gradients=average_aggregated_gradients,
+                        optimizer_type=LocalGradientAggregationHelper._OPTIMIZER_TYPE_KERAS,
+                    )
+
             super(self.__class__, self).__init__(**kwargs)
 
         def get_gradients(self, loss, params):
@@ -63,16 +76,29 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
 
         def _allreduce(self, grads):
             self._aggregated_gradients = True
-            return self._allreduce_grads(grads)
+
+            if self._agg_helper:
+                return self._agg_helper.compute_gradients(tuple(grads))
+            else:
+                return self._allreduce_grads(grads)
 
         def apply_gradients(self, *args, **kwargs):
-            results = super(self.__class__, self).apply_gradients(*args, **kwargs)
+            if self._agg_helper:
+                result = self._agg_helper.apply_gradients(
+                    lambda: super(self.__class__, self).apply_gradients(*args, **kwargs),
+                    self,
+                    *args,
+                    **kwargs,
+                )
+            else:
+                result = super(self.__class__, self).apply_gradients(*args, **kwargs)
+
             if not self._aggregated_gradients:
                 raise Exception('`apply_gradients()` was called without a call to '
                                 '`get_gradients()` or `_aggregate_gradients`. If you\'re '
                                 'using TensorFlow 2.0, please specify '
                                 '`experimental_run_tf_function=False` in `compile()`.')
-            return results
+            return result
 
     # We dynamically create a new class that inherits from the optimizer that was passed in.
     # The goal is to override get_gradients() method with an allreduce implementation.
