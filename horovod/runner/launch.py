@@ -588,8 +588,12 @@ def _run_static(args):
         if settings.verbose >= 2:
             print('SSH was successful into all the remote hosts.')
 
+    print("args.nics: " + str(args.nics))
+
     nics = driver_service.get_common_interfaces(settings, all_host_names,
                                                 remote_host_names, fn_cache)
+
+    print("common interfaces: " + str(nics))
 
     if args.run_func:
         # get the driver IPv4 address
