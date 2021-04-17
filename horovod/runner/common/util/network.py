@@ -147,6 +147,7 @@ class BasicService(object):
 
     def _get_local_addresses(self):
         result = {}
+        print("Getting local addresses in network.py: " + str(self._nics))
         for intf, intf_addresses in psutil.net_if_addrs().items():
             if self._nics and intf not in self._nics:
                 continue

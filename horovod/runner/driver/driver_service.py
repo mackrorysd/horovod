@@ -146,9 +146,10 @@ def _run_probe(driver, settings, num_hosts):
     if settings.verbose >= 2:
         print('Host-to-host interface checking successful.')
     # Determine a set of common interfaces for task-to-task communication.
-    print("Task addresses: " + str(driver.task_addresses_for_tasks))
+    print("Task addresses: " + str(driver.task_addresses_for_tasks(0)))
     nics = set(driver.task_addresses_for_tasks(0).keys())
     for index in range(1, num_hosts):
+        print("Task addresses: " + str(driver.task_addresses_for_tasks(index)))
         nics.intersection_update(
             driver.task_addresses_for_tasks(index).keys())
     if not nics:
