@@ -146,6 +146,7 @@ def _run_probe(driver, settings, num_hosts):
     if settings.verbose >= 2:
         print('Host-to-host interface checking successful.')
     # Determine a set of common interfaces for task-to-task communication.
+    print("Task addresses: " + str(driver.task_addresses_for_tasks))
     nics = set(driver.task_addresses_for_tasks(0).keys())
     for index in range(1, num_hosts):
         nics.intersection_update(
@@ -200,6 +201,7 @@ def get_local_interfaces(settings):
     # 127.0.0.1
     nics = set()
     for iface, addrs in net_if_addrs().items():
+        print("Checking local interface: " + str(iface) + "; " + str(addrs))
         if settings.nics and iface not in settings.nics:
             continue
         for addr in addrs:
@@ -234,6 +236,9 @@ def get_common_interfaces(settings, all_host_names, remote_host_names=None, fn_c
 
     if remote_host_names is None:
         remote_host_names = network.filter_local_addresses(all_host_names)
+
+    print("all_host_names: " + str(all_host_names))
+    print("remote_host_names: " + str(remote_host_names))
 
     if len(remote_host_names) > 0:
         if settings.nics:
