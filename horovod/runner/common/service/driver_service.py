@@ -93,6 +93,7 @@ class BasicDriverService(network.BasicService):
             return network.AckResponse()
 
         if isinstance(req, RegisterTaskToTaskAddressesRequest):
+            print("Task being registered to task address: " + str(req.task_addresses))
             self.register_task_to_task_addresses(req.index, req.task_addresses)
             return network.AckResponse()
 
@@ -213,4 +214,6 @@ class BasicDriverClient(network.BasicClient):
         return resp.all_task_addresses
 
     def register_task_to_task_addresses(self, index, task_addresses):
+        print("Registering task to task addresses: " + str(task_addresses))
+        traceback.print_stack()
         self._send(RegisterTaskToTaskAddressesRequest(index, task_addresses))
