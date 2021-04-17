@@ -57,7 +57,7 @@ class BasicDriverService(network.BasicService):
             self._wait_cond.acquire()
             try:
                 assert 0 <= req.index < self._num_proc
-                print("Setting address from RegisterTaskRequest: " + str(req.task_address))
+                print("Setting address from RegisterTaskRequest: " + str(req.task_addresses))
                 self._all_task_addresses[req.index] = req.task_addresses
                 # Just use source address for service for fast probing.
                 self._task_addresses_for_driver[req.index] = \
