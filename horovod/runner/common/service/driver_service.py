@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import threading
+import traceback
 
 from horovod.runner.common.util import network
 
@@ -56,6 +57,7 @@ class BasicDriverService(network.BasicService):
             self._wait_cond.acquire()
             try:
                 assert 0 <= req.index < self._num_proc
+                print("Setting address from RegisterTaskRequest: " + str(req.task_address))
                 self._all_task_addresses[req.index] = req.task_addresses
                 # Just use source address for service for fast probing.
                 self._task_addresses_for_driver[req.index] = \
@@ -202,6 +204,8 @@ class BasicDriverClient(network.BasicClient):
                                                 match_intf=match_intf)
 
     def register_task(self, index, task_addresses, host_hash):
+        print("Registering driver client")
+        traceback.print_stack()
         self._send(RegisterTaskRequest(index, task_addresses, host_hash))
 
     def all_task_addresses(self, index):
